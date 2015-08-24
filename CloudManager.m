@@ -1,6 +1,6 @@
 //
 //  CloudManager.m
-//  libfindit
+//  ownCloudManager
 //
 //  Created by dev_iphone on 06/03/14.
 //  Copyright (c) 2014 Level-App. All rights reserved.
@@ -8,91 +8,151 @@
 
 #import "CloudManager.h"
 
-static CloudManager * s_cloudManagerInstance = nil;
-
+#import "OCCommunication.h"
 #import "OCFileDto.h"
-#import "Constants.h"
+
+static NSString * const kCloudRemoteServiceUrl = @"https://example.owncloud.com";
+static NSString * const kCloudRemoteBaseUrl = @"/owncloud/remote.php/webdav/";
+#define kCloudRemoteRootPath [NSString stringWithFormat:@"%@%@", kCloudRemoteServiceUrl, kCloudRemoteBaseUrl]
+
+static NSString * const kCloudUser = @"username";
+static NSString * const kCloudPassword = @"password";
+
+static NSString * const kCloudLocalFolder = @"Caches/cloud";
+#define kCloudLocalPath [[NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) \
+objectAtIndex:0] stringByAppendingPathComponent:kCloudLocalFolder]
+
+@interface CloudItem () {
+    Boolean m_isDirectory;
+    NSString * m_remotePath;
+    NSString * m_localPath;
+    NSDate * m_remoteCreationDate;
+}
+
+@end
 
 @implementation CloudItem
 
-@synthesize isDirectory;
+@synthesize isDirectory = m_isDirectory;
 @synthesize remotePath = m_remotePath;
 @synthesize localPath = m_localPath;
 @synthesize remoteCreationDate = m_remoteCreationDate;
 
-- (id)initWithDirectory:(Boolean)aIsDirectory andRemotePath:(NSString *)aRemotePath andLocalPath:(NSString *)aLocalPath andRemoteCreationDate:(NSDate *)aRemoteCreationDate {
+- (instancetype)initWithRemotePath:(NSString *)remotePath
+                         localPath:(NSString *)localPath
+                remoteCreationDate:(NSDate *)remoteCreationDate
+                       isDirectory:(Boolean)isDirectory {
+    
     self = [super init];
+    
     if (self) {
-        [self setIsDirectory:aIsDirectory];
-        [self setRemotePath:aRemotePath];
-        [self setLocalPath:aLocalPath];
-        [self setRemoteCreationDate:aRemoteCreationDate];
+        m_isDirectory = isDirectory;
+        m_remotePath = remotePath;
+        m_localPath = localPath;
+        m_remoteCreationDate = remoteCreationDate;
     }
+    
     return self;
 }
 
-+ (CloudItem *)CloudItemWithDirectory:(Boolean)aIsDirectory andRemotePath:(NSString *)aRemotePath andLocalPath:(NSString *)aLocalPath andRemoteCreationDate:(NSDate *)aRemoteCreationDate {
-    CloudItem * item = [[CloudItem alloc] initWithDirectory:aIsDirectory andRemotePath:aRemotePath andLocalPath:aLocalPath andRemoteCreationDate:aRemoteCreationDate];
+
++ (CloudItem *)cloudItemWithRemotePath:(NSString *)remotePath
+                             localPath:(NSString *)localPath
+                    remoteCreationDate:(NSDate *)remoteCreationDate
+                           isDirectory:(Boolean)isDirectory {
+    
+    CloudItem * item = [[CloudItem alloc] initWithRemotePath:remotePath
+                                                   localPath:localPath
+                                          remoteCreationDate:remoteCreationDate
+                                                 isDirectory:isDirectory];
     return item;
+}
+
+@end
+
+@interface CloudManager () {
+    //ownCloud
+    OCCommunication * m_communication;
+    Boolean m_isSynced;
+    Boolean m_errorOccured;
+    
+    //Folders
+    NSMutableArray * m_folders;
+    
+    //Update
+    NSMutableArray * m_newFolders;
+    NSMutableArray * m_updateFiles;
+    
+    NSOperation * m_downloadOperation;
+    NSInteger m_currentNbDownloadFiles;
+    NSInteger m_totalDownloadFiles;
 }
 
 @end
 
 @implementation CloudManager
 
-@synthesize communication = m_communication;
-@synthesize folders = m_folders;
-@synthesize currentFolderPath = m_currentFolderPath;
-@synthesize downloadOperation = m_downloadOperation;
-@synthesize delegate;
 @synthesize isSynced = m_isSynced;
 
-+ (CloudManager *)instance; {
-	if (s_cloudManagerInstance == nil) {
-		s_cloudManagerInstance = [[CloudManager alloc] init];
-	}
+#pragma mark - Init
+
++ (instancetype)sharedInstance; {
+    static id s_cloudManagerInstance = nil;
     
-	return s_cloudManagerInstance;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        s_cloudManagerInstance = [[self alloc] init];
+    });
+    
+    return s_cloudManagerInstance;
 }
 
-- (id)init {
+
+- (instancetype)init {
     self = [super init];
+    
     if (self) {
         m_communication = [[OCCommunication alloc] init];
         m_newFolders = [[NSMutableArray alloc] init];
         m_updateFiles = [[NSMutableArray alloc] init];
         m_folders = [[NSMutableArray alloc] init];
-
-        //Cloud path check
+        
+        //Create cloud local path if needed
         [self checkCloudPath];
         
-        //Connect
-        [self connectWithUser:CLOUD_USERNAME andPassword:CLOUD_PASSWORD];
+        //Initialize credentials
+        [m_communication setCredentialsWithUser:kCloudUser andPassword:kCloudPassword];
+        [m_communication setCredentialsWithApiKey:kCloudAPIKey andMode:kCloudISMode];
     }
+    
     return self;
 }
 
+
 #pragma mark - Paths
 
-+ (NSString *)cloudPath {
-    NSString * documentsDirectory = [NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES) objectAtIndex:0];
-    NSString * cloudPath = [NSString stringWithFormat:@"%@/Caches/cloud", documentsDirectory];
+- (void)checkCloudPath {
+    NSFileManager * fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:kCloudLocalPath]) {
+        [fm createDirectoryAtPath:kCloudLocalPath withIntermediateDirectories:NO attributes:nil error:nil];
+    }
+}
+
+
+- (void)createNewFolders:(NSArray *)folders {
+    NSFileManager * fm = [NSFileManager defaultManager];
+    for (CloudItem * item in folders) {
+        [fm createDirectoryAtPath:item.localPath withIntermediateDirectories:NO attributes:nil error:nil];
+    }
+}
+
+
+#pragma mark - Synchronize
+
+- (void)synchronize:(id<PCloudDelegate>)delegate {
+    [self setDelegate:delegate];
     
-    return cloudPath;
-}
-
-+ (NSString *)levelsPath {
-    return [NSString stringWithFormat:@"%@/%@", [CloudManager cloudPath], LEVELS_DIRECTORY_NAME];
-}
-
-+ (NSString *)getLevelPath:(int)levelId {
-    return [NSString stringWithFormat:@"%@/%@%d.json", [CloudManager levelsPath], LEVEL_PREFIX, levelId];
-}
-
-#pragma mark - Engine
-
-- (void)synchronize:(id<PCloudDelegate>)aDelegate {
-    [self setDelegate:aDelegate];
+    //Reset
     m_errorOccured = NO;
     
     [m_newFolders removeAllObjects];
@@ -101,29 +161,100 @@ static CloudManager * s_cloudManagerInstance = nil;
     
     m_currentNbDownloadFiles = 0;
     
-    [m_folders addObject:CLOUD_REMOTE_ROOT_PATH];
-    
-    [self readFolders];
+    //Start from root folder
+    [m_folders addObject:kCloudRemoteRootPath];
+    [self readFolders:m_folders];
 }
 
-- (void)checkCloudPath {
-    NSFileManager * fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:[CloudManager cloudPath]]) {
-        [fm createDirectoryAtPath:[CloudManager cloudPath] withIntermediateDirectories:NO attributes:nil error:nil];
+
+#pragma mark - Read
+
+- (void)readFolders:(NSArray *)folders {
+    //Browse folders
+    if ([folders count] > 0) {
+        NSString * folderPath = [folders objectAtIndex:0];
+        [self readFolder:folderPath];
+        
+    } else {
+        //Browsing is over
+        NSLog(@"sync finish");
+        
+        //Create new folders
+        if ([m_newFolders count] > 0) {
+            [self createNewFolders:m_newFolders];
+        }
+        
+        m_totalDownloadFiles = [m_updateFiles count];
+        
+        //Notify delegate
+        [self.delegate onCloudInitDoneWithSuccess:YES andError:nil andNbFiles:m_totalDownloadFiles];
+        
+        //Start download
+        [self downloadFiles:m_updateFiles];
     }
 }
 
-- (void)connectWithUser:(NSString *)user andPassword:(NSString *)password {
-    [m_communication setCredentialsWithUser:user andPassword:password];
+
+- (void)readFolder:(NSString *)path {
+    //Remove escapes
+    path = [path stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
+    
+    [m_communication readFolder:path
+                onCommunication:m_communication
+                 successRequest:^(NSHTTPURLResponse * response, NSArray * items, NSString * redirected) {
+                     //Success
+                     NSLog(@"success");
+                     NSMutableArray * newFolders = [NSMutableArray array];
+                     
+                     for (OCFileDto * file in items) {
+                         //Check parser
+                         NSLog(@"Item file name: %@, path: %@", file.fileName, file.filePath);
+                         
+                         if (file.fileName != nil) {
+                             //Follow reading
+                             if (file.isDirectory) {
+                                 [newFolders addObject:[NSString stringWithFormat:@"%@%@%@", kCloudRemoteServiceUrl,
+                                                        file.filePath, file.fileName]];
+                             }
+                             
+                             //Update
+                             CloudItem * updateItem = [self isNewOrUpdated:file];
+                             if (updateItem != nil) {
+                                 if (updateItem.isDirectory) {
+                                     [m_newFolders addObject:updateItem];
+                                     
+                                 } else {
+                                     [m_updateFiles addObject:updateItem];
+                                 }
+                             }
+                         }
+                     }
+                     
+                     //Add new folders
+                     NSLog(@"found %ld new folders", (unsigned long)[newFolders count]);
+                     [m_folders addObjectsFromArray:newFolders];
+                     
+                     //Remove one read
+                     [m_folders removeObjectAtIndex:0];
+                     [self readFolders:m_folders];
+                     
+                 } failureRequest:^(NSHTTPURLResponse * response, NSError * error) {
+                     //Request failure
+                     NSLog(@"Error: %@", error);
+                     
+                     //Notify delegate
+                     [self.delegate onCloudInitDoneWithSuccess:NO andError:error andNbFiles:-1];
+                 }];
 }
+
 
 - (CloudItem *)isNewOrUpdated:(OCFileDto *)file {
     CloudItem * returnItem = nil;
     
     NSString * fileName = [file.fileName stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
-
-    NSString * remotePath = [NSString stringWithFormat:@"%@%@%@", CLOUD_REMOTE_SERVICE_URL, file.filePath, fileName];
-    NSString * localPath = [remotePath stringByReplacingOccurrencesOfString:CLOUD_REMOTE_ROOT_PATH withString:[CloudManager cloudPath]];
+    NSString * remotePath = [NSString stringWithFormat:@"%@%@%@", kCloudRemoteServiceUrl, file.filePath, fileName];
+    NSString * localPath = [remotePath stringByReplacingOccurrencesOfString:kCloudRemoteRootPath
+                                                                 withString:kCloudLocalPath];
     
     NSFileManager * fm = [NSFileManager defaultManager];
     
@@ -131,9 +262,13 @@ static CloudManager * s_cloudManagerInstance = nil;
     Boolean fileExists = [fm fileExistsAtPath:localPath isDirectory:&isDirectory];
     NSDate * remoteDate = [NSDate dateWithTimeIntervalSince1970:file.date];
     long remoteSize = file.size;
-
+    
     if (!fileExists) {
-        returnItem = [CloudItem CloudItemWithDirectory:file.isDirectory andRemotePath:remotePath andLocalPath:localPath andRemoteCreationDate:remoteDate];
+        returnItem = [CloudItem cloudItemWithRemotePath:remotePath
+                                              localPath:localPath
+                                     remoteCreationDate:remoteDate
+                                            isDirectory:file.isDirectory];
+        
     } else if (!file.isDirectory) {
         NSTimeInterval interval = 0;
         
@@ -150,145 +285,91 @@ static CloudManager * s_cloudManagerInstance = nil;
         if (localDate != nil) {
             interval = [remoteDate timeIntervalSinceDate:localDate];
         }
-
-        //Check creation dates
-        if ((interval > 0) || (localSize != remoteSize)) {
-            returnItem = [CloudItem CloudItemWithDirectory:isDirectory andRemotePath:remotePath andLocalPath:localPath andRemoteCreationDate:remoteDate];
+        
+        //Check creation dates and size to update if needed
+        if (interval > 0 || localSize != remoteSize) {
+            returnItem = [CloudItem cloudItemWithRemotePath:remotePath
+                                                  localPath:localPath
+                                         remoteCreationDate:remoteDate
+                                                isDirectory:isDirectory];
         }
     }
     
     return returnItem;
 }
 
-- (void)readFolder:(NSString *)path {
-    //Remove escapes
-    path = [path stringByReplacingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
-    
-    [m_communication readFolder:path onCommunication:m_communication successRequest:^(NSHTTPURLResponse * response, NSArray * items, NSString * redirected) {
-        //Success
-        NSLog(@"success");
-        NSMutableArray * newFolders = [NSMutableArray array];
-        
-        for (OCFileDto * file in items) {
-            //Check parser
-            NSLog(@"Item file name: %@, path: %@", file.fileName, file.filePath);
-            
-            if (file.fileName != nil) {
-                //Follow reading
-                if (file.isDirectory) {
-                    [newFolders addObject:[NSString stringWithFormat:@"%@%@%@", CLOUD_REMOTE_SERVICE_URL, file.filePath, file.fileName]];
-                }
-                
-                //Update
-                CloudItem * updateItem = [self isNewOrUpdated:file];
-                if (updateItem != nil) {
-                    if (updateItem.isDirectory) {
-                        [m_newFolders addObject:updateItem];
-                    } else {
-                        [m_updateFiles addObject:updateItem];
-                    }
-                }
-            }
-        }
-        
-        //Add new folders
-        NSLog(@"found %ld new folders", (unsigned long)[newFolders count]);
-        [m_folders addObjectsFromArray:newFolders];
-        
-        //Remove one read
-        [m_folders removeObjectAtIndex:0];
-        [self readFolders];
-        
-    } failureRequest:^(NSHTTPURLResponse * response, NSError * error) {
-        //Request failure
-        NSLog(@"Error: %@", error);
-        //TODO : error handling
-        [self.delegate onCloudInitDoneWithSuccess:NO andError:nil andNbFiles:-1];
-    }];
-}
 
-- (void)createNewDirectories {
-    NSFileManager * fm = [NSFileManager defaultManager];
-    
-    for (CloudItem * item in m_newFolders) {
-        [fm createDirectoryAtPath:item.localPath withIntermediateDirectories:NO attributes:nil error:nil];
-    }
-}
-
-- (void)onDownloadFileError {
-    [self.downloadOperation cancel];
-//    [self.delegate onCloudSyncDoneWithSuccess:NO andError:nil];
-    m_errorOccured = YES;
-    
-    //Remove failed file
-    [m_updateFiles removeObjectAtIndex:0];
-    [self downloadFiles];
-}
+#pragma mark - Download
 
 - (void)downloadFile:(CloudItem *)item {
-    self.downloadOperation = [m_communication downloadFile:item.remotePath toDestiny:item.localPath withLIFOSystem:NO onCommunication:m_communication progressDownload:^(NSUInteger bytesRead, long long totalBytesRead, long long totalExpectedBytesRead) {
-        //Progress
-        NSLog(@"%@", [NSString stringWithFormat:@"Downloading: %lld bytes", totalBytesRead]);
-    } successRequest:^(NSHTTPURLResponse * response, NSString * redirectedServer) {
-        //Success
-//        NSLog(@"LocalFile : %@", localPath);
-//        _pathOfDownloadFile = localPath;
-//        UIImage *image = [[UIImage alloc]initWithContentsOfFile:localPath];
-//        _downloadedImageView.image = image;
-//        _progressLabel.text = @"Success";
-//        _deleteLocalFile.enabled = YES;
-        
-        //Change file creation date
-        NSFileManager * fm = [NSFileManager defaultManager];
-        NSMutableDictionary * localAttributes = [NSMutableDictionary dictionaryWithDictionary:[fm attributesOfItemAtPath:item.localPath error:nil]];
-        
-        NSDate * remoteDate = item.remoteCreationDate;
-        [localAttributes setValue:remoteDate forKey:NSFileCreationDate];
-        [fm setAttributes:localAttributes ofItemAtPath:item.localPath error:nil];
-        
-        m_currentNbDownloadFiles++;
-        [self.delegate onCloudSyncWithProgress:m_currentNbDownloadFiles andTotalProgress:m_totalDownloadFiles];
-
-        //Remove downloaded file
-        [m_updateFiles removeObjectAtIndex:0];
-        [self downloadFiles];
-    } failureRequest:^(NSHTTPURLResponse * response, NSError * error) {
-        //Request failure
-        NSLog(@"error while download a file: %@", error);
-        [self onDownloadFileError];
-    } shouldExecuteAsBackgroundTaskWithExpirationHandler:^{
-        //No background handling wanted
-        [self onDownloadFileError];
-    }];
+    m_downloadOperation = [m_communication downloadFile:item.remotePath
+                                              toDestiny:item.localPath
+                                         withLIFOSystem:NO
+                                        onCommunication:m_communication
+                                       progressDownload:
+                           ^(NSUInteger bytesRead, long long totalBytesRead, long long totalExpectedBytesRead) {
+                               //Progress
+                               NSLog(@"%@", [NSString stringWithFormat:@"Downloading: %lld bytes", totalBytesRead]);
+                               
+                           } successRequest:
+                           ^(NSHTTPURLResponse * response, NSString * redirectedServer) {
+                               //Change file creation date
+                               NSFileManager * fm = [NSFileManager defaultManager];
+                               NSMutableDictionary * localAttributes = [NSMutableDictionary dictionaryWithDictionary:
+                                                                        [fm attributesOfItemAtPath:item.localPath
+                                                                                             error:nil]];
+                               
+                               [localAttributes setValue:item.remoteCreationDate forKey:NSFileCreationDate];
+                               [fm setAttributes:localAttributes ofItemAtPath:item.localPath error:nil];
+                               
+                               //Notify delegate
+                               m_currentNbDownloadFiles++;
+                               [self.delegate onCloudSyncWithProgress:m_currentNbDownloadFiles
+                                                     andTotalProgress:m_totalDownloadFiles];
+                               
+                               //Remove downloaded file
+                               [m_updateFiles removeObjectAtIndex:0];
+                               [self downloadFiles:m_updateFiles];
+                               
+                           } failureRequest:^(NSHTTPURLResponse * response, NSError * error) {
+                               //Request failure
+                               NSLog(@"error while download a file: %@", error);
+                               [self onDownloadFileError];
+                               
+                           } shouldExecuteAsBackgroundTaskWithExpirationHandler:^{
+                               //No background handling wanted
+                               [self onDownloadFileError];
+                           }];
 }
 
-- (void)downloadFiles {
-    if ([m_updateFiles count] > 0) {
-        CloudItem * item = [m_updateFiles objectAtIndex:0];
+
+- (void)downloadFiles:(NSArray *)files {
+    //Download new file
+    if ([files count] > 0) {
+        CloudItem * item = [files objectAtIndex:0];
         [self downloadFile:item];
+        
     } else {
         NSLog(@"download finish");
         m_isSynced = YES;
+        
+        //Notify delegate
         [self.delegate onCloudSyncDoneWithSuccess:!m_errorOccured andError:nil];
     }
 }
 
-- (void)readFolders {
-    if ([m_folders count] > 0) {
-        NSString * folderPath = [m_folders objectAtIndex:0];
-        
-        [self setCurrentFolderPath:folderPath];
-        [self readFolder:self.currentFolderPath];
-    } else {
-        NSLog(@"sync finish");
-        [self createNewDirectories];
-        
-        m_totalDownloadFiles = [m_updateFiles count];
-        
-        [self.delegate onCloudInitDoneWithSuccess:YES andError:nil andNbFiles:m_totalDownloadFiles];
-        
-        [self downloadFiles];
-    }
+
+- (void)onDownloadFileError {
+    //Cancel operation
+    [m_downloadOperation cancel];
+    
+    m_errorOccured = YES;
+    
+    //Remove failed file
+    [m_updateFiles removeObjectAtIndex:0];
+    
+    //Continue download
+    [self downloadFiles:m_updateFiles];
 }
 
 @end
